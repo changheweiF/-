@@ -1,0 +1,168 @@
+#!/bin/sh
+
+# -------- 用户配置 --------
+USER_ACCOUNT="《用户》"
+USER_PASSWORD="${CAMPUS_PASSWORD:-《密码》}"
+LOGIN_URL="http://《认证IP:端口号》/eportal/?c=Portal&a=login"
+LOGOUT_URL="http://《认证IP:端口号》/eportal/?c=Portal&a=logout"
+WLAN_AC_IP="《AP的IP地址》"
+WLAN_AC_NAME="《AP的名字》"
+# -------- 用户配置结束 --------
+
+# -------- 系统路径 --------
+IP="/sbin/ip"
+CURL="/usr/bin/curl"
+PING="/bin/ping"
+GREP="/bin/grep"
+MKDIR="/bin/mkdir"
+RM="/bin/rm"
+FIND="/usr/bin/find"
+STAT="/usr/bin/stat"
+UBUS="/bin/ubus"
+LOGGER="/usr/bin/logger"
+
+# -------- 文件与日志 --------
+LOG_DIR="/var/log/campus_net"
+LOG_FILE="${LOG_DIR}/$(date +%Y%m%d).log"
+TMP_DIR="/tmp/campus_net"
+LOCKFILE="/var/run/campus_net.lock"
+MAX_LOG_SIZE=5242880    # 5MB
+MAX_LOG_AGE=7
+LAST_LOGIN_FILE="${TMP_DIR}/last_login_time"
+
+# -------- 网络与检测 --------
+PING_TARGETS="223.5.5.5 8.8.8.8 114.114.114.114"
+CHECK_INTERVAL=60
+MAX_CHECK_INTERVAL=300
+MIN_CHECK_INTERVAL=30
+LOGIN_FAIL_LIMIT=5
+
+# -------- 初始化 --------
+$MKDIR -p "$LOG_DIR" "$TMP_DIR" "$(dirname "$LOCKFILE")"
+exec 9>"$LOCKFILE"
+flock -n 9 || { $LOGGER -t campus_net "脚本已在运行"; exit 0; }
+
+# -------- 工具函数 --------
+log_msg() {
+    local msg="[$(date '+%F %T')] $1"
+    echo "$msg" | tee -a "$LOG_FILE"
+    $LOGGER -t "campus_net" "$msg"
+
+    # 自动清空日志（超过5MB）
+    [ -f "$LOG_FILE" ] && [ "$($STAT -c%s "$LOG_FILE" 2>/dev/null)" -gt "$MAX_LOG_SIZE" ] && {
+        echo "[$(date '+%F %T')] 日志超过5MB，自动清空" > "$LOG_FILE"
+    }
+}
+
+get_iface() { $IP route | awk '/default/ {print $5; exit}'; }
+get_ip() { $IP -4 addr show "$1" | awk '/inet / {print $2}' | cut -d/ -f1; }
+get_mac() { cat /sys/class/net/"$1"/address | tr -d ':'; }
+
+is_network_connected() {
+    local iface=$(get_iface)
+    [ -n "$iface" ] && $IP link show "$iface" | $GREP -q "state UP"
+}
+
+check_internet() {
+    $CURL -s -o /dev/null -m 5 "http://connect.rom.miui.com/generate_204"
+}
+
+# -------- 登录相关 --------
+try_login() {
+    local iface=$(get_iface)
+    [ -z "$iface" ] && { log_msg "找不到默认接口"; return 1; }
+
+    # 登录冷却期（防止频繁登录）
+    if [ -f "$LAST_LOGIN_FILE" ] && [ $(( $(date +%s) - $(cat "$LAST_LOGIN_FILE") )) -lt 30 ]; then
+        log_msg "登录过于频繁，跳过"
+        return 0
+    fi
+
+    local wlan_ip=$(get_ip "$iface")
+    local wlan_mac=$(get_mac "$iface")
+    local ts=$(date +%s%3N)
+    local callback="dr${ts}"
+
+    local url="${LOGIN_URL}&callback=${callback}&login_method=1&user_account=%2C0%2C${USER_ACCOUNT}&user_password=${USER_PASSWORD}&wlan_user_ip=${wlan_ip}&wlan_user_mac=${wlan_mac}&wlan_ac_ip=${WLAN_AC_IP}&wlan_ac_name=${WLAN_AC_NAME}&jsVersion=3.1&_=${ts}"
+
+    log_msg "尝试登录：${USER_ACCOUNT}@${wlan_ip}"
+    local resp=$($CURL -m 8 -sS "$url")
+
+    if echo "$resp" | $GREP -q "认证成功"; then
+        log_msg "✅ 登录成功"
+        date +%s > "$LAST_LOGIN_FILE"
+        return 0
+    elif echo "$resp" | $GREP -q "已在线"; then
+        log_msg "✅ 已在线，无需重复认证"
+        date +%s > "$LAST_LOGIN_FILE"
+        return 0
+    else
+        log_msg "❌ 登录失败：$(echo "$resp" | $GREP -o '"message":"[^"]*"' | head -n1)"
+        return 1
+    fi
+}
+
+restart_iface() {
+    local iface=$(get_iface)
+    [ -n "$iface" ] || return
+    log_msg "重启接口：$iface"
+    $UBUS call network.interface.wan restart >/dev/null 2>&1 || {
+        $IP link set "$iface" down; sleep 2; $IP link set "$iface" up
+    }
+    sleep 5
+}
+
+# -------- 主循环 --------
+LOGIN_FAIL=0
+
+log_msg "======== 校园网自动登录守护启动 ========"
+
+while true; do
+    if ! is_network_connected; then
+        log_msg "网络接口未连接"
+        sleep 10
+        continue
+    fi
+
+    # ping检测
+    net_ok=0
+    for p in $PING_TARGETS; do
+        if $PING -c1 -W2 "$p" >/dev/null 2>&1; then
+            net_ok=1
+            break
+        fi
+    done
+
+    if [ $net_ok -eq 1 ]; then
+        if check_internet; then
+            log_msg "网络正常"
+            LOGIN_FAIL=0
+            [ $CHECK_INTERVAL -lt $MAX_CHECK_INTERVAL ] && CHECK_INTERVAL=$((CHECK_INTERVAL+10))
+            sleep $CHECK_INTERVAL
+            continue
+        else
+            log_msg "检测到DNS/HTTP异常，尝试重新登录"
+        fi
+    else
+        log_msg "Ping全失败，网络疑似断开"
+    fi
+
+    # 登录逻辑
+    if try_login; then
+        LOGIN_FAIL=0
+        CHECK_INTERVAL=$MIN_CHECK_INTERVAL
+        sleep 15
+        continue
+    fi
+
+    LOGIN_FAIL=$((LOGIN_FAIL+1))
+    log_msg "登录失败计数：$LOGIN_FAIL"
+
+    if [ "$LOGIN_FAIL" -ge "$LOGIN_FAIL_LIMIT" ]; then
+        log_msg "连续失败 $LOGIN_FAIL 次，重启WAN接口"
+        restart_iface
+        LOGIN_FAIL=0
+    fi
+
+    sleep 20
+done
