@@ -1,21 +1,295 @@
-下载者两个文件，放在对应的位置
+### **/usr/bin/campus-login.sh**（主脚本）
 
-"/etc/auto_login_daemon.sh"
+```shell
+#!/bin/sh
 
-“/etc/init.d/auto_login”
+# =======================
+#   Campus Login Script
+#   Version: 6.x
+# =======================
 
-添加执行权限
-```shell
-chmod +x /etc/init.d/auto_login
-chmod +x /etc/auto_login_daemon.sh
+# === 用户配置区（需要自行填写）===
+USERNAME="your_username_here"
+PASSWORD="your_password_here"
+LOGIN_URL="http://110.188.xx.xx:801/eportal/portal/login"   # 替换成学校认证地址
+SUCCESS_FLAG='"result":"1"'
+
+# === 运行配置 ===
+LOG_FILE="/var/log/campus-login.log"
+LOG_MAX=10240   # 10MB
+CHECK_INTERVAL=30
+REAUTH_INTERVAL=3600   # 一小时强制重认证（可自行调整）
+LAST_AUTH_FILE="/tmp/campus-last-auth"
+
+# 日志函数
+log(){
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+    size=$(wc -c < "$LOG_FILE")
+    [ "$size" -gt "$LOG_MAX" ] && echo "" > "$LOG_FILE"
+}
+
+# 检查网络状态
+check_network(){
+    ping -c 1 -W 1 223.5.5.5 >/dev/null 2>&1 && return 0
+    curl -s --max-time 2 https://www.baidu.com >/dev/null 2>&1 && return 0
+    return 1
+}
+
+# DHCP 续租检查（适配 OpenWrt udhcpc）
+check_dhcp(){
+    ps | grep '[u]dhcpc' >/dev/null || {
+        log "DHCP 可能掉线，正在重启 WAN..."
+        ifup wan
+        sleep 3
+    }
+}
+
+# 登录
+do_login(){
+    log "尝试登录校园网..."
+
+    RESPONSE=$(curl -s -d "userId=$USERNAME&password=$PASSWORD" "$LOGIN_URL")
+
+    echo "$RESPONSE" | grep -q "$SUCCESS_FLAG"
+    if [ $? -eq 0 ]; then
+        echo "$(date +%s)" > "$LAST_AUTH_FILE"
+        log "✔ 登录成功"
+        return 0
+    else
+        FRAG=$(echo "$RESPONSE" | head -c 80)
+        log "❌ 登录失败 | 响应片段: $FRAG"
+        return 1
+    fi
+}
+
+# 主循环
+main_loop(){
+    log "校园网自动登录服务已启动"
+    [ ! -f "$LAST_AUTH_FILE" ] && echo 0 > "$LAST_AUTH_FILE"
+
+    while true; do
+        NOW=$(date +%s)
+        LAST=$(cat "$LAST_AUTH_FILE")
+        DIFF=$((NOW - LAST))
+
+        check_dhcp
+
+        if [ $DIFF -ge $REAUTH_INTERVAL ]; then
+            log "达到强制重认证时间（${DIFF}s），正在重新登录..."
+            do_login
+        else
+            if ! check_network; then
+                log "检测到无网络，正在重新登录..."
+                do_login
+            fi
+        fi
+
+        sleep $CHECK_INTERVAL
+    done
+}
+
+main_loop
+
 ```
-使用方法：
-1. 填入参数
-2. 使用语句运行开机自启动
+
+### /etc/init.d/campus-login
+
 ```shell
-   /etc/init.d/auto_login enable
+#!/bin/sh /etc/rc.common
+
+START=95
+STOP=10
+USE_PROCD=1
+
+SERVICE_NAME="campus-login"
+SCRIPT="/usr/bin/campus-login.sh"
+
+start_service() {
+    procd_open_instance
+    procd_set_param command /bin/sh "$SCRIPT"
+    procd_set_param respawn 2000 5 5
+    procd_close_instance
+}
+
+stop_service() {
+    killall campus-login.sh 2>/dev/null
+}
+
 ```
-3. 开始运行
+
+### 📌 说明（分享给同学的简易文档）
+
+1. #### 将脚本保存到路由器
+
+   ```shell
+   scp campus-login.sh root@192.168.1.1:/usr/bin/
+   scp campus-login /etc/init.d/
+   ```
+
+2. #### 赋予执行权限
+
+   ```sh
+   chmod +x /usr/bin/campus-login.sh
+   chmod +x /etc/init.d/campus-login
+   ```
+
+3. #### 启动并设置开机自启
+
+   ```shell
+   /etc/init.d/campus-login enable
+   /etc/init.d/campus-login start
+   ```
+
+4. #### 查看日志
+
+   ```shell
+   tail -f /var/log/campus-login.log
+   ```
+
+
+
+# 📘 校园网自动登录使用指南（OpenWrt / ImmortalWrt）
+
+本工具用于在校园网需要认证的环境中运行于 **OpenWrt / ImmortalWrt 路由器**上，实现：
+
+- 自动登录校园网
+- 断网自动重连
+- DHCP 续租检测
+- 强制重认证（可关）
+- 10MB 滚动日志
+- 支持 procd 自动守护
+
+### 📦 1. 系统要求
+
+- 系统：OpenWrt / ImmortalWrt（建议 21.x / 22.x / 23.x）
+- 架构：不限
+- 需要 curl（系统自带）
+
+### 📂 2. 文件结构
+
+| 文件路径                   | 作用                         |
+| :------------------------- | ---------------------------- |
+| `/usr/bin/campus-login.sh` | 自动登录主脚本               |
+| `/etc/init.d/campus-login` | 启动脚本，负责开机启动、守护 |
+
+### ⚙  3. 安装步骤
+
+#### **① 上传脚本到路由器**
+
+将下载的两个文件上传到：
+
 ```shell
-   /etc/init.d/auto_login start
+/usr/bin/campus-login.sh
+/etc/init.d/campus-login
 ```
+
+例如用 WinSCP 或 scp：
+
+```shell
+scp campus-login.sh root@192.168.1.1:/usr/bin/
+scp campus-login root@192.168.1.1:/etc/init.d/
+```
+
+------
+
+#### **② 赋予执行权限**
+
+```shell
+chmod +x /usr/bin/campus-login.sh
+chmod +x /etc/init.d/campus-login
+```
+
+------
+
+#### **③ 编辑脚本填写账号密码**
+
+```shell
+vi /usr/bin/campus-login.sh
+```
+
+找到：
+
+```shell
+USERNAME="your_username_here"
+PASSWORD="your_password_here"
+LOGIN_URL="http://xxx.xxx.xxx.xxx:801/eportal/portal/login"
+```
+
+改成你自己的信息。
+
+------
+
+#### **④ 启动服务**
+
+```
+/etc/init.d/campus-login enable
+/etc/init.d/campus-login start
+```
+
+服务会自动后台运行，并随系统启动。
+
+------
+
+### 🔍 4. 查看运行状态
+
+查看最新日志：
+
+```
+tail -f /var/log/campus-login.log
+```
+
+查看服务是否在运行：
+
+```
+ps | grep campus-login
+```
+
+------
+
+### 🔄 5. 更新脚本
+
+直接替换文件即可：
+
+```
+cp new-campus-login.sh /usr/bin/campus-login.sh
+/etc/init.d/campus-login restart
+```
+
+------
+
+### 📑 6. 功能说明
+
+#### ✔ 自动认证
+
+每隔 30 秒检测一次网络状态，如果发现掉线，自动登录。
+
+#### ✔ 认证成功缓存
+
+成功认证后，记录时间到：
+
+```
+/tmp/campus-last-auth
+```
+
+用于防止频繁重复登录。
+
+#### ✔ 强制重认证
+
+默认 3600 秒（1 小时）自动重新登录一次，可自行修改。
+
+#### ✔ DHCP 续租检测
+
+如果 udhcpc 掉线，会自动 `ifup wan` 续租。
+
+#### ✔ 网络质量检测
+
+支持：
+
+- ping Alibaba DNS（223.5.5.5）
+- curl HTTPS
+
+任一成功即判定“有网”。
+
+#### ✔ 日志轮换（10MB）
+
+超过 10MB 自动清空，避免占满闪存。
